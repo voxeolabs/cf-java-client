@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import org.cloudfoundry.client.lib.archive.ApplicationArchive;
+import org.cloudfoundry.client.lib.domain.ApplicationLog;
 import org.cloudfoundry.client.lib.domain.ApplicationStats;
 import org.cloudfoundry.client.lib.domain.CloudApplication;
 import org.cloudfoundry.client.lib.domain.CloudApplication.DebugMode;
@@ -317,7 +318,7 @@ public class CloudFoundryClient implements CloudFoundryOperations {
 	}
 
 	/**
-	 * @deprecated use {@link #streamLogs(String, ApplicationLogListener)} or {@link #streamRecentLogs(String, ApplicationLogListener)}
+	 * @deprecated use {@link #streamLogs(String, ApplicationLogListener)} or {@link #getRecentLogs(String)}
 	 */
 	public Map<String, String> getLogs(String appName) {
 		return cc.getLogs(appName);
@@ -327,10 +328,13 @@ public class CloudFoundryClient implements CloudFoundryOperations {
 	    return cc.streamLogs(appName, listener);
 	}
 
-    public StreamingLogToken streamRecentLogs(String appName, ApplicationLogListener listener) {
-        return cc.streamRecentLogs(appName, listener);
-    }
-	
+	public List<ApplicationLog> getRecentLogs(String appName) {
+		return cc.getRecentLogs(appName);
+	}
+
+	/**
+	 * @deprecated use {@link #streamLogs(String, ApplicationLogListener)} or {@link #getRecentLogs(String)}
+	 */
 	public Map<String, String> getCrashLogs(String appName) {
 		return cc.getCrashLogs(appName);
 	}
@@ -356,6 +360,10 @@ public class CloudFoundryClient implements CloudFoundryOperations {
 				endPosition + " is not a valid value for end position, it should be greater than startPosition " +
 						"which is " + startPosition + ".");
 		return cc.getFile(appName, instanceIndex, filePath, startPosition, endPosition - 1);
+	}
+
+	public void openFile(String appName, int instanceIndex, String filePath, ClientHttpResponseCallback callback) {
+		cc.openFile(appName, instanceIndex, filePath, callback);
 	}
 
 	public String getFileTail(String appName, int instanceIndex, String filePath, int length) {
@@ -427,6 +435,10 @@ public class CloudFoundryClient implements CloudFoundryOperations {
 
 	public List<CloudDomain> getDomains() {
 		return cc.getDomains();
+	}
+
+	public CloudDomain getDefaultDomain() {
+		return cc.getDefaultDomain();
 	}
 
 	public void addDomain(String domainName) {

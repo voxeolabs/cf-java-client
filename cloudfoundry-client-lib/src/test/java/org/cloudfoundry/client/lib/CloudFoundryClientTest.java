@@ -15,6 +15,7 @@ import static org.junit.Assume.assumeTrue;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -31,8 +32,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.commons.io.IOUtils;
 import org.apache.http.HttpHost;
 import org.apache.http.conn.params.ConnRoutePNames;
+import org.cloudfoundry.client.lib.domain.ApplicationLog;
 import org.cloudfoundry.client.lib.domain.ApplicationStats;
 import org.cloudfoundry.client.lib.domain.CloudApplication;
 import org.cloudfoundry.client.lib.domain.CloudDomain;
@@ -207,7 +210,7 @@ public class CloudFoundryClientTest {
 		connectedClient = new CloudFoundryClient(new CloudCredentials(CCNG_USER_EMAIL, CCNG_USER_PASS),
 				cloudControllerUrl, CCNG_USER_ORG, CCNG_USER_SPACE, httpProxyConfiguration, CCNG_API_SSL);
 		connectedClient.login();
-		defaultDomainName = getDefaultDomain(connectedClient.getDomains()).getName();
+		defaultDomainName = connectedClient.getDefaultDomain().getName();
 
 		// Optimization to avoid redoing the work already done is tearDown()
 		if (!tearDownComplete) {
@@ -279,7 +282,7 @@ public class CloudFoundryClientTest {
 		HttpHost proxy = new HttpHost("127.0.0.1", inJvmProxyPort);
 		commonsFactory.getHttpClient().getParams().setParameter(ConnRoutePNames.DEFAULT_PROXY, proxy);
 		restTemplate.setRequestFactory(requestFactory);
-		restTemplate.execute(CCNG_API_URL + "/info", HttpMethod.GET,null, null);
+		restTemplate.execute(CCNG_API_URL + "/info", HttpMethod.GET, null, null);
 
 		//then executes fines, and the jetty proxy indeed received one request
 		assertEquals("expected network calls to make it through the inJvmProxy.", 1, nbInJvmProxyRcvReqs.get());
@@ -999,40 +1002,49 @@ public class CloudFoundryClientTest {
 	
 	@Test
 	public void streamLogs() throws Exception {
-        String appName = namespacedAppName("simple_logs");
-        CloudApplication app = createAndUploadAndStartSimpleSpringApp(appName);
-        boolean pass = getInstanceInfosWithTimeout(appName, 1, true);
-        assertTrue("Couldn't get the right application state", pass);
+		String appName = namespacedAppName("simple_logs");
+		CloudApplication app = createAndUploadAndStartSimpleSpringApp(appName);
+		boolean pass = getInstanceInfosWithTimeout(appName, 1, true);
+		assertTrue("Couldn't get the right application state", pass);
 
-        AccumulatingApplicationLogListener testListener = new AccumulatingApplicationLogListener();
-        connectedClient.streamRecentLogs(appName, testListener);
-        
-        int attempt = 0;
-        do {
-            if (testListener.logs.size() > 0) {
-                break;
-            }
-            Thread.sleep(1000);    
-        } while (attempt < 20);
-        assertTrue("Failed to see recent logs", testListener.logs.size() > 0);
-        
-        testListener.logs.clear();
-        connectedClient.streamLogs(appName, testListener);
-        String appUri = "http://" + app.getUris().get(0);
-        RestTemplate appTemplate = new RestTemplate();
-        attempt = 0;
-        do {
-            // no need to sleep, visiting the app uri should be sufficient
-            try {
-                appTemplate.getForObject(appUri, String.class);
-            } catch (HttpClientErrorException ex) {
-                // ignore
-            }
-            if (testListener.logs.size() > 0) {
-                break;
-            }
-        } while(attempt < 20);
-        assertTrue("Failed to stream normal log", testListener.logs.size() > 0);
+		List<ApplicationLog> logs = doGetRecentLogs(appName);
+
+		for (int index = 0; index < logs.size() - 1; index++) {
+			int comparison = logs.get(index).getTimestamp().compareTo(logs.get(index + 1).getTimestamp());
+			assertTrue("Logs are not properly sorted", comparison <= 0);
+		}
+
+		AccumulatingApplicationLogListener testListener = new AccumulatingApplicationLogListener();
+		connectedClient.streamLogs(appName, testListener);
+		String appUri = "http://" + app.getUris().get(0);
+		RestTemplate appTemplate = new RestTemplate();
+		int attempt = 0;
+		do {
+			// no need to sleep, visiting the app uri should be sufficient
+			try {
+				appTemplate.getForObject(appUri, String.class);
+			} catch (HttpClientErrorException ex) {
+				// ignore
+			}
+			if (testListener.logs.size() > 0) {
+				break;
+			}
+		} while (attempt++ < 30);
+		assertTrue("Failed to stream normal log", testListener.logs.size() > 0);
+	}
+
+	private List<ApplicationLog> doGetRecentLogs(String appName) throws InterruptedException {
+		int attempt = 0;
+		do {
+			List<ApplicationLog> logs = connectedClient.getRecentLogs(appName);
+
+			if (logs.size() > 0) {
+				return logs;
+			}
+			Thread.sleep(1000);
+		} while (attempt++ < 20);
+		fail("Failed to see recent logs");
+		return null;
 	}
 
 	@Test
@@ -1063,6 +1075,14 @@ public class CloudFoundryClientTest {
 		doGetFile(connectedClient, appName);
 	}
 
+	@Test
+	public void openFile() throws Exception {
+		String appName = namespacedAppName("simple_openFile");
+		createAndUploadAndStartSimpleSpringApp(appName);
+		boolean running = getInstanceInfosWithTimeout(appName, 1, true);
+		assertTrue("App failed to start", running);
+		doOpenFile(connectedClient, appName);
+	}
 
 	//
 	// Basic Services tests
@@ -1260,8 +1280,7 @@ public class CloudFoundryClientTest {
 
 	@Test
 	public void defaultDomainFound() throws Exception {
-		List<CloudDomain> domains = connectedClient.getSharedDomains();
-		assertNotNull(getDefaultDomain(domains));
+		assertNotNull(connectedClient.getDefaultDomain());
 	}
 
 	@Test
@@ -1270,7 +1289,7 @@ public class CloudFoundryClientTest {
 
 		List<CloudDomain> allDomains = connectedClient.getDomains();
 
-		assertNotNull(getDefaultDomain(allDomains));
+		assertNotNull(getDomainNamed(defaultDomainName, allDomains));
 		assertNotNull(getDomainNamed(TEST_DOMAIN, allDomains));
 	}
 
@@ -1295,7 +1314,6 @@ public class CloudFoundryClientTest {
 	}
 
 	private void assertDomainNotInList(List<CloudDomain> domains) {
-		assertTrue(domains.size() >= 1);
 		assertNull(getDomainNamed(TEST_DOMAIN, domains));
 	}
 
@@ -1351,7 +1369,7 @@ public class CloudFoundryClientTest {
 
 	@Test
 	public void infoAvailableWithoutLoggingIn() throws Exception {
-		CloudFoundryClient infoClient = new CloudFoundryClient(new URL(CCNG_API_URL), httpProxyConfiguration);
+		CloudFoundryClient infoClient = new CloudFoundryClient(new URL(CCNG_API_URL), httpProxyConfiguration, CCNG_API_SSL);
 		CloudInfo info = infoClient.getCloudInfo();
 		assertNotNull(info.getName());
 		assertNotNull(info.getSupport());
@@ -1518,6 +1536,45 @@ public class CloudFoundryClientTest {
 		return pass;
 	}
 
+	private void doOpenFile(CloudFoundryClient client, String appName) throws Exception {
+		String appDir = "app";
+		String fileName = appDir + "/WEB-INF/web.xml";
+		String emptyPropertiesFileName = appDir + "/WEB-INF/classes/empty.properties";
+
+		// File is often not available immediately after starting an app... so
+		// allow up to 60 seconds wait
+		for (int i = 0; i < 60; i++) {
+			try {
+				client.getFile(appName, 0, fileName);
+				break;
+			} catch (HttpServerErrorException ex) {
+				Thread.sleep(1000);
+			}
+		}
+		// Test open file
+
+		client.openFile(appName, 0, fileName, new ClientHttpResponseCallback() {
+
+			public void onClientHttpResponse(ClientHttpResponse clientHttpResponse) throws IOException {
+				InputStream in = clientHttpResponse.getBody();
+				assertNotNull(in);
+				byte[] fileContents = IOUtils.toByteArray(in);
+				assertTrue(fileContents.length > 5);
+			}
+		});
+
+		client.openFile(appName, 0, emptyPropertiesFileName, new ClientHttpResponseCallback() {
+
+			public void onClientHttpResponse(ClientHttpResponse clientHttpResponse) throws IOException {
+				InputStream in = clientHttpResponse.getBody();
+				assertNotNull(in);
+				byte[] fileContents = IOUtils.toByteArray(in);
+				assertTrue(fileContents.length == 0);
+			}
+		});
+
+	}
+
 	private void doGetFile(CloudFoundryClient client, String appName) throws Exception {
 		String appDir = "app";
 		String fileName = appDir + "/WEB-INF/web.xml";
@@ -1623,7 +1680,13 @@ public class CloudFoundryClientTest {
 	}
 
 	private static String defaultNamespace(String email) {
-		return email.substring(0, email.indexOf('@')).replaceAll("\\.", "-").replaceAll("\\+", "-");
+		String s;
+		if(email.contains("@")) {
+			s = email.substring(0, email.indexOf('@'));
+		} else {
+			s = email;
+		}
+		return s.replaceAll("\\.", "-").replaceAll("\\+", "-");
 	}
 
 	//
@@ -1811,15 +1874,6 @@ public class CloudFoundryClientTest {
 		return null;
 	}
 
-	private CloudDomain getDefaultDomain(List<CloudDomain> domains) {
-		for (CloudDomain domain : domains) {
-			if (domain.getOwner().getName().equals("none")) {
-				return domain;
-			}
-		}
-		return null;
-	}
-
 	private String computeAppUrl(String appName) {
 		return appName + "." + defaultDomainName;
 	}
@@ -1865,18 +1919,18 @@ public class CloudFoundryClientTest {
 	}
 
 	private class AccumulatingApplicationLogListener implements ApplicationLogListener {
-	    private List<ApplicationLog> logs = new ArrayList<ApplicationLog>();
-	    
-        public void onMessage(ApplicationLog log) {
-            logs.add(log);
-        }
+		private List<ApplicationLog> logs = new ArrayList<ApplicationLog>();
 
-        public void onError(Throwable exception) {
-            fail(exception.getMessage());
-        }
+		public void onMessage(ApplicationLog log) {
+			logs.add(log);
+		}
 
-        public void onComplete() {
-        }
-	    
+		public void onError(Throwable exception) {
+			fail(exception.getMessage());
+		}
+
+		public void onComplete() {
+		}
+
 	}
 }

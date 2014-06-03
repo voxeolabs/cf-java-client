@@ -36,17 +36,13 @@ import java.util.UUID;
 import java.util.zip.ZipFile;
 
 import javax.websocket.ClientEndpointConfig;
-import javax.websocket.ContainerProvider;
-import javax.websocket.DeploymentException;
-import javax.websocket.Session;
-import javax.websocket.WebSocketContainer;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.cloudfoundry.client.lib.ApplicationLogListener;
+import org.cloudfoundry.client.lib.ClientHttpResponseCallback;
 import org.cloudfoundry.client.lib.CloudCredentials;
 import org.cloudfoundry.client.lib.CloudFoundryException;
-import org.cloudfoundry.client.lib.CloudOperationException;
 import org.cloudfoundry.client.lib.RestLogCallback;
 import org.cloudfoundry.client.lib.StartingInfo;
 import org.cloudfoundry.client.lib.StreamingLogToken;
@@ -54,6 +50,7 @@ import org.cloudfoundry.client.lib.UploadStatusCallback;
 import org.cloudfoundry.client.lib.archive.ApplicationArchive;
 import org.cloudfoundry.client.lib.archive.DirectoryApplicationArchive;
 import org.cloudfoundry.client.lib.archive.ZipApplicationArchive;
+import org.cloudfoundry.client.lib.domain.ApplicationLog;
 import org.cloudfoundry.client.lib.domain.ApplicationStats;
 import org.cloudfoundry.client.lib.domain.CloudApplication;
 import org.cloudfoundry.client.lib.domain.CloudDomain;
@@ -100,7 +97,6 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.ResponseErrorHandler;
 import org.springframework.web.client.ResponseExtractor;
 import org.springframework.web.client.RestTemplate;
-import org.springframework.web.util.UriTemplate;
 
 /**
  * Abstract implementation of the CloudControllerClient intended to serve as the base.
@@ -129,13 +125,13 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 
 	private URL cloudControllerUrl;
 
+	private LoggregatorClient loggregatorClient;
+
 	protected CloudCredentials cloudCredentials;
 
 	protected OAuth2AccessToken token;
 
 	private final Log logger;
-
-	private static final UriTemplate loggregatorUriTemplate = new UriTemplate("{endpoint}/{kind}/?app={appId}");
 
 	/**
 	 * Only for unit tests. This works around the fact that the initialize method is called within the constructor and
@@ -145,26 +141,29 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		logger = LogFactory.getLog(getClass().getName());
 	}
 
-	public CloudControllerClientImpl(URL cloudControllerUrl, RestTemplate restTemplate, OauthClient oauthClient,
+	public CloudControllerClientImpl(URL cloudControllerUrl, RestTemplate restTemplate,
+	                                 OauthClient oauthClient, LoggregatorClient loggregatorClient,
 	                                 CloudCredentials cloudCredentials, CloudSpace sessionSpace) {
 		logger = LogFactory.getLog(getClass().getName());
 
-		initialize(cloudControllerUrl, restTemplate, oauthClient, cloudCredentials);
+		initialize(cloudControllerUrl, restTemplate, oauthClient, loggregatorClient, cloudCredentials);
 
 		this.sessionSpace = sessionSpace;
 	}
 
-	public CloudControllerClientImpl(URL cloudControllerUrl, RestTemplate restTemplate, OauthClient oauthClient,
+	public CloudControllerClientImpl(URL cloudControllerUrl, RestTemplate restTemplate,
+	                                 OauthClient oauthClient, LoggregatorClient loggregatorClient,
 	                                 CloudCredentials cloudCredentials, String orgName, String spaceName) {
 		logger = LogFactory.getLog(getClass().getName());
 		CloudControllerClientImpl tempClient =
-				new CloudControllerClientImpl(cloudControllerUrl, restTemplate, oauthClient, cloudCredentials, null);
+				new CloudControllerClientImpl(cloudControllerUrl, restTemplate,
+						oauthClient, loggregatorClient, cloudCredentials, null);
 
 		if (tempClient.token == null) {
 			tempClient.login();
 		}
 
-		initialize(cloudControllerUrl, restTemplate, oauthClient, cloudCredentials);
+		initialize(cloudControllerUrl, restTemplate, oauthClient, loggregatorClient, cloudCredentials);
 
 		this.sessionSpace = validateSpaceAndOrg(spaceName, orgName, tempClient);
 
@@ -172,7 +171,7 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 	}
 
 	private void initialize(URL cloudControllerUrl, RestTemplate restTemplate, OauthClient oauthClient,
-	                        CloudCredentials cloudCredentials) {
+	                        LoggregatorClient loggregatorClient, CloudCredentials cloudCredentials) {
 		Assert.notNull(cloudControllerUrl, "CloudControllerUrl cannot be null");
 		Assert.notNull(restTemplate, "RestTemplate cannot be null");
 		Assert.notNull(oauthClient, "OauthClient cannot be null");
@@ -187,6 +186,8 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		configureCloudFoundryRequestFactory(restTemplate);
 
 		this.oauthClient = oauthClient;
+
+		this.loggregatorClient = loggregatorClient;
 	}
 
 	private CloudSpace validateSpaceAndOrg(String spaceName, String orgName, CloudControllerClientImpl client) {
@@ -221,15 +222,24 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		String instance = String.valueOf(0);
 		return doGetLogs(urlPath, appName, instance);
 	}
-	
-	public StreamingLogToken streamRecentLogs(String appName, ApplicationLogListener listener) {
-	    return streamLoggregatorLogs(appName, listener, true);
+
+	public List<ApplicationLog> getRecentLogs(String appName) {
+		AccumulatingApplicationLogListener listener = new AccumulatingApplicationLogListener();
+		streamLoggregatorLogs(appName, listener, true);
+		synchronized (listener) {
+			try {
+				listener.wait();
+			} catch (InterruptedException e) {
+				// return any captured logs
+			}
+		}
+		return listener.getLogs();
 	}
 
-    public StreamingLogToken streamLogs(String appName, ApplicationLogListener listener) {
-        return streamLoggregatorLogs(appName, listener, false);
-    }
-	
+	public StreamingLogToken streamLogs(String appName, ApplicationLogListener listener) {
+		return streamLoggregatorLogs(appName, listener, false);
+	}
+
 	public Map<String, String> getCrashLogs(String appName) {
 		String urlPath = getFileUrlPath();
 		CrashesInfo crashes = getCrashes(appName);
@@ -248,6 +258,13 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		String urlPath = getFileUrlPath();
 		Object appId = getFileAppId(appName);
 		return doGetFile(urlPath, appId, instanceIndex, filePath, startPosition, endPosition);
+	}
+
+
+	public void openFile(String appName, int instanceIndex, String filePath, ClientHttpResponseCallback callback) {
+		String urlPath = getFileUrlPath();
+		Object appId = getFileAppId(appName);
+		doOpenFile(urlPath, appId, instanceIndex, filePath, callback);
 	}
 
 	public void registerRestLogListener(RestLogCallback callBack) {
@@ -422,6 +439,13 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 			logs.put(logFile, doGetFile(urlPath, appId, instance, logFile, -1, -1));
 		}
 		return logs;
+	}
+
+	@SuppressWarnings("unchecked")
+	protected void doOpenFile(String urlPath, Object app, int instanceIndex, String filePath,
+			ClientHttpResponseCallback callback) {
+		getRestTemplate().execute(getUrl(urlPath), HttpMethod.GET, null, new ResponseExtractorWrapper(callback), app,
+				String.valueOf(instanceIndex), filePath);
 	}
 
 	protected String doGetFile(String urlPath, Object app, int instanceIndex, String filePath, int startPosition, int endPosition) {
@@ -1374,6 +1398,15 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		return doGetDomains("/v2/shared_domains");
 	}
 
+	public CloudDomain getDefaultDomain() {
+		List<CloudDomain> sharedDomains = getSharedDomains();
+		if (sharedDomains.isEmpty()) {
+			return null;
+		} else {
+			return sharedDomains.get(0);
+		}
+	}
+
 	public void addDomain(String domainName) {
 		assertSpaceProvided("add domain");
 		UUID domainGuid = getDomainGuid(domainName, false);
@@ -1589,31 +1622,46 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		return guid;
 	}
 
-    private StreamingLogToken streamLoggregatorLogs(String appName, ApplicationLogListener listener, boolean recent) {
-        ClientEndpointConfig.Configurator configurator = new ClientEndpointConfig.Configurator() {
-            public void beforeRequest(Map<String,List<String>> headers) {
-                if (token != null) {
-                    headers.put(AUTHORIZATION_HEADER_KEY, Arrays.asList(getAuthorizationHeader()));
-                }
-            }
-        };
-        
-        UUID appId = getAppId(appName);
-        CloudInfo cloudInfo = getInfo();
-        String mode = recent ? "dump" : "tail";
-        URI loggregatorUri = loggregatorUriTemplate.expand(cloudInfo.getLoggregatorEndpoint(), mode, appId);
-        try {
-            WebSocketContainer container = ContainerProvider.getWebSocketContainer();
-            ClientEndpointConfig config = ClientEndpointConfig.Builder.create().configurator(configurator).build();
-            Session session = container.connectToServer(new LoggregatorEndpoint(listener), config, loggregatorUri);
-            return new StreamingLogTokenImpl(session);
-        } catch (DeploymentException e) {
-            throw new CloudOperationException(e);
-        } catch (IOException e) {
-            throw new CloudOperationException(e);
-        }
-    }
-	
+	private StreamingLogToken streamLoggregatorLogs(String appName, ApplicationLogListener listener, boolean recent) {
+		ClientEndpointConfig.Configurator configurator = new ClientEndpointConfig.Configurator() {
+			public void beforeRequest(Map<String, List<String>> headers) {
+				if (token != null) {
+					headers.put(AUTHORIZATION_HEADER_KEY, Arrays.asList(getAuthorizationHeader()));
+				}
+			}
+		};
+
+		String endpoint = getInfo().getLoggregatorEndpoint();
+		String mode = recent ? "dump" : "tail";
+		UUID appId = getAppId(appName);
+		return loggregatorClient.connectToLoggregator(endpoint, mode, appId, listener, configurator);
+	}
+
+	private class AccumulatingApplicationLogListener implements ApplicationLogListener {
+		private List<ApplicationLog> logs = new ArrayList<ApplicationLog>();
+
+		public void onMessage(ApplicationLog log) {
+			logs.add(log);
+		}
+
+		public void onError(Throwable exception) {
+			synchronized (this) {
+				this.notify();
+			}
+		}
+
+		public void onComplete() {
+			synchronized (this) {
+				this.notify();
+			}
+		}
+
+		public List<ApplicationLog> getLogs() {
+			Collections.sort(logs);
+			return logs;
+		}
+	}
+
 	private Map<String, Object> findApplicationResource(UUID appGuid, boolean fetchServiceInfo) {
 		Map<String, Object> urlVars = new HashMap<String, Object>();
 		String urlPath = "/v2/apps/{app}?inline-relations-depth=1";
@@ -1731,4 +1779,18 @@ public class CloudControllerClientImpl implements CloudControllerClient {
 		return entity.containsKey(resourceKey) || entity.containsKey(resourceKey + "_url");
 	}
 	
+	private static class ResponseExtractorWrapper implements ResponseExtractor {
+
+		private ClientHttpResponseCallback callback;
+
+		public ResponseExtractorWrapper(ClientHttpResponseCallback callback) {
+			this.callback = callback;
+		}
+
+		public Object extractData(ClientHttpResponse clientHttpResponse) throws IOException {
+			callback.onClientHttpResponse(clientHttpResponse);
+			return null;
+		}
+
+	}
 }
